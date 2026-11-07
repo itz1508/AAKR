@@ -1,0 +1,31 @@
+# AAKR — Runtime configuration.
+# This file declares provider settings and lifecycle defaults.
+# Environment variables (see .env.example) override these values.
+
+# ── Storage provider ──────────────────────────────────────────────────
+storage:
+  provider: sqlite          # sqlite | databricks
+  sqlite:
+    path: ':memory:'         # path to SQLite database file
+  databricks:
+    catalog: oneshot_dev
+    schema: knowledge
+    # host and token are read from AAKR_DATABRICKS_HOST / _TOKEN env vars
+
+# ── Lifecycle ──────────────────────────────────────────────────────────
+lifecycle:
+  db_path: ./aakr_lifecycle.db
+  max_attempts: 3            # bounded retry count per gap
+  review_mode: auto         # auto | manual | external
+  evidence_kind: test_assertion
+  researcher_identity: researcher
+
+# ── Proposal gateway ─────────────────────────────────────────────────
+proposals:
+  store_path: ./aakr_proposals.db
+  trusted: false            # set true only in a trusted, authenticated gateway
+
+# ── Logging ───────────────────────────────────────────────────────────
+logging:
+  level: INFO               # DEBUG | INFO | WARNING | ERROR
+  format: '%(asctime)s %(name)s %(levelname)s %(message)s'

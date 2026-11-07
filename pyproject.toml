@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aakr"
+version = "2.1.0"
+description = "Autonomous Applied Knowledge Registry — provider-neutral catalog with manifest canonicalization, append-only provenance, and source verification."
+requires-python = ">=3.11"
+dependencies = [
+    "rfc8785",
+]
+
+[project.optional-dependencies]
+databricks = ["pyspark>=3.5"]
+dev = ["pytest>=8.0", "ruff", "mypy>=1.8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["aakr"]
+
+[tool.ruff.lint]
+ignore = ["EXE002", "BLE001", "SIM102"]  # Databricks workspace marks all files executable; broad exception catches are intentional for connector/feature detection; nested if statements are more readable for complex conditions
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
