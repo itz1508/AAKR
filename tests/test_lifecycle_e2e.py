@@ -1057,3 +1057,79 @@ def test_s20_full_alias_collision_audit():
     assert normalize_concept("devops") != normalize_concept("infrastructure")
     assert normalize_concept("sre") != normalize_concept("infrastructure")
     assert normalize_concept("software_engineering") != normalize_concept("software")
+
+
+def test_s21_relevance_vs_verification_separation(temp_dir):
+    """S21: Research relevance scores are separate from verification confidence.
+
+    The researcher's confidence reflects keyword match quality (relevance).
+    The verifier independently determines the verdict from stance, coverage,
+    and applicability — NOT from the researcher's confidence.
+    """
+    from aakr.catalog.models import validate_file_hash
+
+    db = os.path.join(temp_dir, "s21.db")
+
+    # Source with high keyword overlap (high relevance) but content
+    # that mentions the keywords without actually supporting the claim
+    pool = [
+        {
+            "doc_id": "d1",
+            "title": "Security Overview",
+            "content": "sql injection parameterized queries security important",
+            "topics": ["sql_injection", "parameterized_queries", "security"],
+        },
+    ]
+
+    item = SubmittedItem(
+        item_id="s21-item",
+        request="test",
+        knowledge_gaps=[
+            KnowledgeGap(
+                "g1",
+                "sql injection prevention",
+                ["sql_injection", "parameterized_queries", "prevention"],
+            ),
+        ],
+        accepted_requirements=[],
+    )
+
+    orch = LifecycleOrchestrator(db, pool, max_attempts=3)
+    state = orch.run_full_lifecycle(item, scope=ReviewScope(include_external=False))
+
+    recs = [r for r in state.research_records if r.gap_id == "g1" and r.confidence > 0]
+    assert len(recs) == 1
+    rec = recs[0]
+
+    # Researcher assigns confidence based on relevance (keyword overlap)
+    assert rec.confidence > 0
+
+    # Verifier independently determines verdict — NOT from researcher confidence
+    verification = state.verification_result
+    assert "g1" in verification
+    # Verdict is from verifier's own assessment, not researcher confidence
+    verdict = verification["g1"]["verdict"]
+    assert verdict in ("verified", "insufficient_evidence", "partial_coverage")
+
+    # Real filesystem symlink test for validate_file_hash
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write("symlink target content")
+        f.flush()
+        real_file = f.name
+
+    file_hash = hashlib.sha256(b"symlink target content").hexdigest()
+
+    # Direct file works
+    assert validate_file_hash(real_file, file_hash) is True
+
+    # Create a real symlink to the file
+    symlink_path = real_file + ".symlink"
+    os.symlink(real_file, symlink_path)
+    try:
+        # Symlink must be rejected (even though target has correct hash)
+        assert validate_file_hash(symlink_path, file_hash) is False
+    finally:
+        os.unlink(symlink_path)
+        os.unlink(real_file)

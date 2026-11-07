@@ -910,10 +910,14 @@ class EvidenceVerifier:
         ]
 
     # ── Main verification ─────────────────────────────────────────────
+    # Research relevance (Researcher.confidence) and evidence verification
+    # confidence are separate concerns. The verifier determines verdicts
+    # solely from its own independent assessment: source authenticity,
+    # content integrity, semantic stance, coverage, and applicability.
+    # The researcher's confidence score is NOT used for verdict determination.
     def verify(
         self, records: list[ResearchRecord], scope: ReviewScope | None = None
     ) -> dict[str, Any]:
-        threshold = scope.min_confidence_threshold if scope else 0.1
         results: dict[str, Any] = {}
         by_gap: dict[str, list[ResearchRecord]] = {}
         for r in records:
@@ -1083,8 +1087,6 @@ class EvidenceVerifier:
                 elif applicability == "unknown":
                     verdict = "unconfirmed_applicability"
                     issues.append("applicability_unconfirmed")
-                elif rec.confidence < threshold:
-                    verdict = "below_threshold"
                 else:
                     verdict = "verified"
 
