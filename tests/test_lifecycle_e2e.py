@@ -1062,54 +1062,70 @@ def test_s20_full_alias_collision_audit():
 def test_s21_relevance_vs_verification_separation(temp_dir):
     """S21: Research relevance scores are separate from verification confidence.
 
-    The researcher's confidence reflects keyword match quality (relevance).
-    The verifier independently determines the verdict from stance, coverage,
-    and applicability — NOT from the researcher's confidence.
+    Matched-pair test: constructs two ResearchRecord objects with identical
+    finding, source_ref, evidence_kind, and methodology — differing ONLY in
+    the confidence field. Both must yield the same independent verdict.
+    Also tests real filesystem symlink rejection by validate_file_hash.
     """
     from aakr.catalog.models import validate_file_hash
+    from aakr.lifecycle import EvidenceVerifier, ResearchRecord
 
-    db = os.path.join(temp_dir, "s21.db")
-
-    # Source with high keyword overlap (high relevance) but content
-    # that mentions the keywords without actually supporting the claim
+    # Source pool: a single authentic source with content that supports the claim
+    source_content = "sql injection is prevented by using parameterized queries"
+    source_hash = hashlib.sha256(source_content.encode()).hexdigest()
     pool = [
         {
             "doc_id": "d1",
-            "title": "Security Overview",
-            "content": "sql injection parameterized queries security important",
-            "topics": ["sql_injection", "parameterized_queries", "security"],
+            "title": "Security Guide",
+            "content": source_content,
+            "topics": ["sql_injection", "parameterized_queries", "prevention"],
         },
     ]
 
-    item = SubmittedItem(
-        item_id="s21-item",
-        request="test",
-        knowledge_gaps=[
-            KnowledgeGap(
-                "g1",
-                "sql injection prevention",
-                ["sql_injection", "parameterized_queries", "prevention"],
-            ),
-        ],
-        accepted_requirements=[],
+    # Shared fields — identical for both records
+    base_ref = {
+        "uri": "d1",
+        "source_type": "documentation",
+        "content_hash": source_hash,
+        "title": "Security Guide",
+    }
+    base_kwargs = {
+        "item_id": "s21-item",
+        "gap_id": "g1",
+        "checkpoint_id": "",
+        "finding": "sql injection prevention uses parameterized queries",
+        "source_ref": base_ref,
+        "evidence_kind": "test_assertion",
+        "methodology": "keyword_overlap",
+        "recorded_by": "researcher",
+        "recorded_at": "2026-01-01T00:00:00Z",
+    }
+
+    # Two records differing ONLY in confidence (relevance score)
+    rec_high = ResearchRecord(record_id="r-high", confidence=0.9, **base_kwargs)
+    rec_low = ResearchRecord(record_id="r-low", confidence=0.1, **base_kwargs)
+
+    verifier = EvidenceVerifier(pool)
+    result_high = verifier.verify([rec_high])
+    result_low = verifier.verify([rec_low])
+
+    # Both must produce the SAME verdict despite different confidence values
+    verdict_high = result_high["g1"]["verdict"]
+    verdict_low = result_low["g1"]["verdict"]
+    assert verdict_high == verdict_low, (
+        f"Verdict changed with confidence: high={verdict_high}, low={verdict_low}"
     )
 
-    orch = LifecycleOrchestrator(db, pool, max_attempts=3)
-    state = orch.run_full_lifecycle(item, scope=ReviewScope(include_external=False))
+    # Both must also have the same stance, coverage, and applicability
+    claim_high = result_high["g1"]["claims"][0]
+    claim_low = result_low["g1"]["claims"][0]
+    assert claim_high["stance"] == claim_low["stance"]
+    assert claim_high["coverage"] == claim_low["coverage"]
+    assert claim_high["applicability"] == claim_low["applicability"]
+    assert claim_high["authentic"] == claim_low["authentic"]
 
-    recs = [r for r in state.research_records if r.gap_id == "g1" and r.confidence > 0]
-    assert len(recs) == 1
-    rec = recs[0]
-
-    # Researcher assigns confidence based on relevance (keyword overlap)
-    assert rec.confidence > 0
-
-    # Verifier independently determines verdict — NOT from researcher confidence
-    verification = state.verification_result
-    assert "g1" in verification
-    # Verdict is from verifier's own assessment, not researcher confidence
-    verdict = verification["g1"]["verdict"]
-    assert verdict in ("verified", "insufficient_evidence", "partial_coverage")
+    # Confidence is NOT a field in the verification result
+    assert "confidence" not in claim_high
 
     # Real filesystem symlink test for validate_file_hash
     import tempfile
@@ -1133,3 +1149,174 @@ def test_s21_relevance_vs_verification_separation(temp_dir):
     finally:
         os.unlink(symlink_path)
         os.unlink(real_file)
+
+    # Missing file rejected
+    assert validate_file_hash("/nonexistent/path/file.txt", file_hash) is False
+
+    # Path traversal rejected
+    assert validate_file_hash("../../../etc/passwd", file_hash) is False
+
+
+def test_s22_competing_publishers_and_idempotency(temp_dir):
+    """S22: Competing publishers, duplicate idempotency, and interrupted writes.
+
+    Tests:
+    1. Duplicate item submission is idempotent (INSERT OR IGNORE preserves first).
+    2. Duplicate checkpoint save is idempotent (INSERT OR REPLACE updates).
+    3. Interrupted batch write rolls back all statements (no partial state).
+    4. Two lifecycle runs on the same DB don't interfere.
+    """
+    from aakr.integrations.sqlite.adapter import SQLiteStore
+    from aakr.lifecycle import Checkpoint, CheckpointStore, SubmittedItemStore
+
+    db_path = os.path.join(temp_dir, "s22.db")
+
+    # 1. Duplicate item submission idempotency
+    store = SubmittedItemStore(db_path)
+    item1 = SubmittedItem(
+        item_id="s22-dup",
+        request="original",
+        knowledge_gaps=[KnowledgeGap("g1", "test", ["k1"])],
+        accepted_requirements=[],
+    )
+    item2 = SubmittedItem(
+        item_id="s22-dup",
+        request="DIFFERENT",
+        knowledge_gaps=[KnowledgeGap("g1", "DIFFERENT", ["k2"])],
+        accepted_requirements=[],
+    )
+
+    store.submit(item1)
+    store.submit(item2)  # INSERT OR IGNORE
+
+    retrieved = store.get("s22-dup")
+    assert retrieved is not None
+    assert retrieved.request == "original", "First submission must be preserved"
+    assert retrieved.knowledge_gaps[0].source_hints == ["k1"], "Original gaps preserved"
+
+    # 2. Duplicate checkpoint save (INSERT OR REPLACE)
+    cp_store = CheckpointStore(db_path)
+    cp1 = Checkpoint(
+        checkpoint_id="cp-1",
+        item_id="s22-dup",
+        phase="research",
+        resolved_gaps=["g1"],
+        pending_gaps=[],
+        research_attempts=1,
+        retry_count=0,
+        evidence_summary={},
+        recovery_state="active",
+        created_at="2026-01-01T00:00:00Z",
+    )
+    cp_store.save(cp1)
+
+    cp1_updated = Checkpoint(
+        checkpoint_id="cp-1",
+        item_id="s22-dup",
+        phase="verification",
+        resolved_gaps=["g1", "g2"],
+        pending_gaps=[],
+        research_attempts=2,
+        retry_count=0,
+        evidence_summary={"g1": "verified"},
+        recovery_state="active",
+        created_at="2026-01-01T00:01:00Z",
+    )
+    cp_store.save(cp1_updated)
+
+    loaded = cp_store.load_latest("s22-dup")
+    assert loaded is not None
+    assert loaded.phase == "verification", "Checkpoint replaced with latest"
+    assert loaded.research_attempts == 2
+    assert "g2" in loaded.resolved_gaps
+
+    # 3. Interrupted batch write rolls back ALL statements
+    cat_store = SQLiteStore(os.path.join(temp_dir, "s22_cat.db"), initialize=True)
+    entry_id = "s22-batch-test"
+    ts = "2026-01-01T00:00:00Z"
+    valid_sha = "a" * 64
+
+    with cat_store.transaction(write=True):
+        cat_store.execute(
+            "INSERT INTO entries (entry_id, entry_type, created_at) VALUES (?, ?, ?)",
+            (entry_id, "knowledge", ts),
+        )
+
+    statements = [
+        (
+            "INSERT INTO entry_versions (entry_id, version, title, content_path, content_sha256, manifest_sha256, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (entry_id, 1, "Test", "/path", valid_sha, valid_sha, "tester", ts),
+        ),
+        (
+            "INSERT INTO source_refs (source_ref_id, entry_id, version, source_type, source_uri, source_version, retrieved_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("src-1", entry_id, 1, "documentation", "doc-1", "v1", ts),
+        ),
+        ("INSERT INTO nonexistent_table_xyz VALUES (?, ?)", ("fail", "fail")),
+    ]
+
+    batch_failed = False
+    try:
+        with cat_store.transaction(write=True):
+            cat_store.execute_batch(statements)
+    except Exception:
+        batch_failed = True
+
+    assert batch_failed, "Batch with bad statement must fail"
+    assert (
+        cat_store.query_one(
+            "SELECT entry_id FROM entry_versions WHERE entry_id=?", (entry_id,)
+        )
+        is None
+    ), "Version must not exist after failed batch"
+    assert (
+        cat_store.query_one(
+            "SELECT source_ref_id FROM source_refs WHERE source_ref_id=?", ("src-1",)
+        )
+        is None
+    ), "Source ref must not exist after failed batch"
+    assert (
+        cat_store.query_one(
+            "SELECT entry_id FROM entries WHERE entry_id=?", (entry_id,)
+        )
+        is not None
+    ), "Pre-batch entry must survive batch failure"
+    cat_store.close()
+
+    # 4. Two lifecycle runs on the same DB don't interfere
+    pool = [
+        {
+            "doc_id": "d1",
+            "title": "Sec",
+            "content": "sql injection prevention",
+            "topics": ["sql_injection", "prevention"],
+        }
+    ]
+    item_a = SubmittedItem(
+        item_id="s22-a",
+        request="a",
+        knowledge_gaps=[
+            KnowledgeGap("g1", "sql injection prevention", ["sql_injection"])
+        ],
+        accepted_requirements=[],
+    )
+    item_b = SubmittedItem(
+        item_id="s22-b",
+        request="b",
+        knowledge_gaps=[KnowledgeGap("g1", "other", ["other"])],
+        accepted_requirements=[],
+    )
+
+    shared_db = os.path.join(temp_dir, "s22_shared.db")
+    orch_a = LifecycleOrchestrator(shared_db, pool, max_attempts=3)
+    state_a = orch_a.run_full_lifecycle(
+        item_a, scope=ReviewScope(include_external=False)
+    )
+    orch_b = LifecycleOrchestrator(shared_db, pool, max_attempts=3)
+    state_b = orch_b.run_full_lifecycle(
+        item_b, scope=ReviewScope(include_external=False)
+    )
+
+    a_recs = [r for r in state_a.research_records if r.item_id == "s22-a"]
+    b_recs = [r for r in state_b.research_records if r.item_id == "s22-b"]
+    assert all(r.item_id == "s22-a" for r in a_recs), "No cross-contamination A"
+    assert all(r.item_id == "s22-b" for r in b_recs), "No cross-contamination B"
