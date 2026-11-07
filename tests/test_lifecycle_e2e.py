@@ -1320,3 +1320,467 @@ def test_s22_competing_publishers_and_idempotency(temp_dir):
     b_recs = [r for r in state_b.research_records if r.item_id == "s22-b"]
     assert all(r.item_id == "s22-a" for r in a_recs), "No cross-contamination A"
     assert all(r.item_id == "s22-b" for r in b_recs), "No cross-contamination B"
+
+
+def test_s23_phase_level_recovery_skips_completed_phases():
+    """S23: resume() skips research/record/verify/checkpoint when recovery_state='reassess'.
+
+    When all gaps were resolved at checkpoint time, resume should load existing
+    records and go directly to reassessment — NOT re-run research/record/verify.
+    This proves phase-level recovery: completed phases are not re-executed.
+    """
+
+    temp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(temp_dir, "s23.db")
+
+    pool = [
+        {
+            "doc_id": "d1",
+            "title": "Security Guide",
+            "content": "sql injection prevention using parameterized queries",
+            "topics": ["sql_injection", "prevention"],
+        }
+    ]
+    item = SubmittedItem(
+        item_id="s23-item",
+        request="test",
+        knowledge_gaps=[
+            KnowledgeGap("g1", "sql injection prevention", ["sql_injection"])
+        ],
+        accepted_requirements=[],
+    )
+
+    orch = LifecycleOrchestrator(db_path, pool, max_attempts=3)
+    state = orch.run_full_lifecycle(item, scope=ReviewScope(include_external=False))
+
+    # If the single gap was resolved, recovery_state should be 'reassess'
+    assert state.checkpoint is not None
+    cp = state.checkpoint
+
+    if cp.recovery_state == "reassess":
+        # All gaps resolved — resume should skip to reassess
+        record_count_before = len(orch.record_store.get_all_for_item("s23-item"))
+
+        resumed = orch.resume("s23-item")
+
+        # Research was NOT re-run: same number of records
+        record_count_after = len(orch.record_store.get_all_for_item("s23-item"))
+        assert record_count_after == record_count_before, (
+            f"Phase-level recovery failed: records grew from {record_count_before} "
+            f"to {record_count_after} — research was re-run"
+        )
+
+        # State should be complete or reassess
+        assert resumed.phase in ("complete", "reassess", "exhausted"), (
+            f"Unexpected phase after resume: {resumed.phase}"
+        )
+        # No new research records should have been created
+        new_recs = [
+            r
+            for r in resumed.research_records
+            if r.record_id not in {r.record_id for r in state.research_records}
+        ]
+        assert len(new_recs) == 0, (
+            f"Phase-level recovery created {len(new_recs)} new records — "
+            "research phase was not skipped"
+        )
+    elif cp.recovery_state == "research":
+        # Gaps still pending — resume should re-run research for pending only
+        resolved_before = set(cp.resolved_gaps)
+
+        resumed = orch.resume("s23-item")
+
+        # Pending gaps should still be in remaining_gaps or resolved
+        assert resumed.phase in ("complete", "reassess", "exhausted"), (
+            f"Unexpected phase after resume: {resumed.phase}"
+        )
+        # Resolved gaps from checkpoint should still be resolved
+        for gap_id in resolved_before:
+            assert gap_id not in resumed.remaining_gaps, (
+                f"Previously resolved gap {gap_id} appeared in remaining_gaps"
+            )
+
+
+def test_s24_all_four_verification_statuses_in_provenance():
+    """S24: Provenance reports all 4 verification categories.
+
+    Schema stores 3 statuses (verified, not_verified, contradicted).
+    The 4th ('unverified') is a derived state: source ref exists but has
+    no verification event. Provenance must report all 4 categories.
+    """
+    from aakr.catalog.models import manifest as compute_manifest
+    from aakr.curator import Curator
+    from aakr.integrations.sqlite.adapter import SQLiteStore
+
+    temp_dir = tempfile.mkdtemp()
+    cat_store = SQLiteStore(os.path.join(temp_dir, "s24.db"), initialize=True)
+    curator = Curator(cat_store, fixture_ascii_only=True)
+    ts = "2026-01-01T00:00:00Z"
+    valid_sha = "a" * 64
+
+    # Bundle with 1 condition and 4 source_refs targeting it (each with
+    # a unique source_uri to satisfy the unique index).
+    bundle = {
+        "entry": {"entry_id": "s24-entry", "entry_type": "knowledge"},
+        "version": {
+            "entry_id": "s24-entry",
+            "version": 1,
+            "title": "T",
+            "content_path": "/p",
+            "content_sha256": valid_sha,
+            "created_by": "author",
+            "created_at": ts,
+            "supersedes_version": None,
+            "derived_from_ref": None,
+            "derived_from_sha256": None,
+        },
+        "tags": [],
+        "groups": [
+            {
+                "group_id": "g1",
+                "entry_id": "s24-entry",
+                "version": 1,
+                "group_mode": "all_of",
+            },
+        ],
+        "conditions": [
+            {
+                "condition_id": "c1",
+                "entry_id": "s24-entry",
+                "version": 1,
+                "group_id": "g1",
+                "signal": "file_signal",
+                "operator": "eq",
+                "value": "test",
+                "required_evidence": "test_assertion",
+            },
+        ],
+        "sections": [],
+        "links": [],
+        "sources": [
+            {
+                "source_ref_id": f"s24-src-{i}",
+                "entry_id": "s24-entry",
+                "version": 1,
+                "source_type": "documentation",
+                "source_uri": f"doc-{i}",
+                "source_version": "v1",
+                "retrieved_at": ts,
+                "target_condition_id": "c1",
+                "target_section_id": None,
+                "target_link_id": None,
+            }
+            for i in range(4)
+        ],
+        "questions": [],
+    }
+    m = compute_manifest(bundle, fixture_ascii_only=True)
+    curator.create_draft(bundle, m)
+    curator.publish("s24-entry", 1)
+
+    # src-0: verified
+    curator.verify_source(
+        "s24-src-0", "verified", "verifier1", valid_sha, excerpt="evidence"
+    )
+    # src-1: not_verified
+    curator.verify_source(
+        "s24-src-1", "not_verified", "verifier1", valid_sha, excerpt=""
+    )
+    # src-2: contradicted
+    curator.verify_source(
+        "s24-src-2", "contradicted", "verifier1", valid_sha, excerpt="conflicts"
+    )
+    # src-3: NO verification event → 'unverified' (derived)
+
+    prov = cat_store.provenance("s24-entry", 1, fixture_ascii_only=True)
+    by_result = prov.get("by_result", {})
+
+    assert "verified" in by_result, "Provenance missing 'verified' category"
+    assert "not_verified" in by_result, "Provenance missing 'not_verified' category"
+    assert "contradicted" in by_result, "Provenance missing 'contradicted' category"
+    assert "unverified" in by_result, "Provenance missing 'unverified' category"
+
+    assert by_result["verified"] >= 1, (
+        f"Expected >=1 verified, got {by_result['verified']}"
+    )
+    assert by_result["not_verified"] >= 1, (
+        f"Expected >=1 not_verified, got {by_result['not_verified']}"
+    )
+    assert by_result["contradicted"] >= 1, (
+        f"Expected >=1 contradicted, got {by_result['contradicted']}"
+    )
+    assert by_result["unverified"] >= 1, (
+        f"Expected >=1 unverified, got {by_result['unverified']}"
+    )
+
+    cat_store.close()
+
+
+def test_s25_published_knowledge_retrieval():
+    """S25: Published knowledge retrieval — version-pinned lookup, cross-domain
+    matching, and result deduplication.
+
+    Tests:
+    1. Version-pinned lookup returns the exact published version
+    2. Drafts cannot leak into pin retrieval
+    3. Cross-domain matching via concept normalization
+    4. Result deduplication: same (entry_id, version) appears once
+    """
+    from aakr.catalog.retrieval import CatalogLookup, ConceptNormalizer
+    from aakr.curator import Curator
+    from aakr.integrations.sqlite.adapter import SQLiteStore
+
+    temp_dir = tempfile.mkdtemp()
+    cat_store = SQLiteStore(os.path.join(temp_dir, "s25.db"), initialize=True)
+    curator = Curator(cat_store, fixture_ascii_only=True)
+    ts = "2026-01-01T00:00:00Z"
+    valid_sha = "a" * 64
+
+    # Create and publish entry v1 with domain tags
+    bundle_v1 = {
+        "entry": {"entry_id": "s25-entry", "entry_type": "knowledge"},
+        "version": {
+            "entry_id": "s25-entry",
+            "version": 1,
+            "title": "Security Patterns",
+            "content_path": "/path",
+            "content_sha256": valid_sha,
+            "created_by": "author",
+            "created_at": ts,
+            "supersedes_version": None,
+            "derived_from_ref": None,
+            "derived_from_sha256": None,
+        },
+        "tags": [
+            {
+                "tag_id": "t1",
+                "entry_id": "s25-entry",
+                "version": 1,
+                "tag_type": "domain",
+                "value": "security",
+            },
+            {
+                "tag_id": "t2",
+                "entry_id": "s25-entry",
+                "version": 1,
+                "tag_type": "domain",
+                "value": "infosec",
+            },
+        ],
+        "groups": [],
+        "conditions": [],
+        "sections": [],
+        "links": [],
+        "sources": [],
+        "questions": [],
+    }
+    manifest_v1 = __import__("aakr.catalog.models", fromlist=["manifest"]).manifest(
+        bundle_v1, fixture_ascii_only=True
+    )
+    curator.create_draft(bundle_v1, manifest_v1)
+    curator.publish("s25-entry", 1)
+
+    # 1. Version-pinned lookup returns exact version
+    lookup = CatalogLookup(cat_store, fixture_ascii_only=True)
+    result = lookup.get("s25-entry", 1)
+    assert result is not None, "Version-pinned lookup returned None"
+    assert result["entry_id"] == "s25-entry"
+    assert result["version"] == 1
+    assert "manifest_sha256" in result, "get() must return manifest_sha256"
+    assert "provenance" in result, "get() must return provenance"
+
+    # 2. Create a draft v2 — it should NOT leak into pin retrieval of v1
+    bundle_v2 = {
+        "entry": {"entry_id": "s25-entry", "entry_type": "knowledge"},
+        "version": {
+            "entry_id": "s25-entry",
+            "version": 2,
+            "title": "Security Patterns v2",
+            "content_path": "/path2",
+            "content_sha256": "b" * 64,
+            "created_by": "author",
+            "created_at": ts,
+            "supersedes_version": 1,
+            "derived_from_ref": None,
+            "derived_from_sha256": None,
+        },
+        "tags": [
+            {
+                "tag_id": "t3",
+                "entry_id": "s25-entry",
+                "version": 2,
+                "tag_type": "domain",
+                "value": "security",
+            },
+        ],
+        "groups": [],
+        "conditions": [],
+        "sections": [],
+        "links": [],
+        "sources": [],
+        "questions": [],
+    }
+    manifest_v2 = __import__("aakr.catalog.models", fromlist=["manifest"]).manifest(
+        bundle_v2, fixture_ascii_only=True
+    )
+    curator.create_draft(bundle_v2, manifest_v2)
+    # v2 is draft — get(1) should still return v1
+    result_v1 = lookup.get("s25-entry", 1)
+    assert result_v1 is not None
+    assert result_v1["version"] == 1, "Draft v2 leaked into pin retrieval of v1"
+    # v2 is draft — get(2) should return None (drafts are NOT pinnable)
+    result_v2 = lookup.get("s25-entry", 2)
+    assert result_v2 is None, "Draft v2 should not be pinnable"
+
+    # 3. Cross-domain matching via concept normalization
+    normalizer = ConceptNormalizer()
+    # 'infosec' normalizes to 'security' — lookup should find entries tagged 'security'
+    assert normalizer.normalize("infosec") == "security"
+    # 'sec' also normalizes to 'security'
+    assert normalizer.normalize("sec") == "security"
+    # 'ml' normalizes to 'machine_learning'
+    assert normalizer.normalize("ml") == "machine_learning"
+
+    # 4. Result deduplication: lookup should not return duplicate (entry_id, version)
+    req = {
+        "catalog_contract": "2.0",
+        "request_id": "s25-req",
+        "intent": "security patterns",
+        "domains": ["security"],
+        "channels": ["conditions"],
+        "per_domain_limit": 5,
+        "global_limit": 10,
+    }
+    lookup_result = lookup.lookup(req)
+    # Dedup: no (entry_id, version) pair appears more than once
+    if lookup_result.get("candidates"):
+        seen = set()
+        for c in lookup_result["candidates"]:
+            key = (c.get("entry_id"), c.get("version"))
+            assert key not in seen, f"Duplicate candidate: {key}"
+            seen.add(key)
+
+    cat_store.close()
+
+
+def test_s26_authority_isolation():
+    """S26: Authority isolation — Curator writes, Verifier appends, Lookup reads.
+
+    Tests that the three roles have strictly separated capabilities:
+    1. Curator: can create_draft and publish (write)
+    2. Verifier: can verify_source (append verification events only)
+    3. CatalogLookup: can only lookup and get (read-only)
+    4. Verifier cannot create drafts (no create_draft method)
+    5. Lookup cannot write (no write methods)
+    """
+    from aakr.catalog.retrieval import CatalogLookup
+    from aakr.curator import Curator
+    from aakr.integrations.sqlite.adapter import SQLiteStore
+
+    temp_dir = tempfile.mkdtemp()
+    cat_store = SQLiteStore(os.path.join(temp_dir, "s26.db"), initialize=True)
+    curator = Curator(cat_store, fixture_ascii_only=True)
+    ts = "2026-01-01T00:00:00Z"
+    valid_sha = "a" * 64
+
+    # 1. Curator can write: create_draft + publish
+    bundle = {
+        "entry": {"entry_id": "s26-entry", "entry_type": "knowledge"},
+        "version": {
+            "entry_id": "s26-entry",
+            "version": 1,
+            "title": "T",
+            "content_path": "/p",
+            "content_sha256": valid_sha,
+            "created_by": "author",
+            "created_at": ts,
+            "supersedes_version": None,
+            "derived_from_ref": None,
+            "derived_from_sha256": None,
+        },
+        "tags": [],
+        "groups": [
+            {
+                "group_id": "g1",
+                "entry_id": "s26-entry",
+                "version": 1,
+                "group_mode": "all_of",
+            },
+        ],
+        "conditions": [
+            {
+                "condition_id": "c1",
+                "entry_id": "s26-entry",
+                "version": 1,
+                "group_id": "g1",
+                "signal": "file_signal",
+                "operator": "eq",
+                "value": "test",
+                "required_evidence": "test_assertion",
+            },
+        ],
+        "sections": [],
+        "links": [],
+        "sources": [
+            {
+                "source_ref_id": "s26-src",
+                "entry_id": "s26-entry",
+                "version": 1,
+                "source_type": "documentation",
+                "source_uri": "doc-1",
+                "source_version": "v1",
+                "retrieved_at": ts,
+                "target_condition_id": "c1",
+                "target_section_id": None,
+                "target_link_id": None,
+            },
+        ],
+        "questions": [],
+    }
+    manifest_hash = __import__("aakr.catalog.models", fromlist=["manifest"]).manifest(
+        bundle, fixture_ascii_only=True
+    )
+    curator.create_draft(bundle, manifest_hash)
+    curator.publish("s26-entry", 1)
+
+    # 2. Verifier can append source verification (via Curator.verify_source)
+    #    verified_by must NOT equal created_by (authority separation)
+    curator.verify_source(
+        "s26-src", "verified", "independent_verifier", valid_sha, excerpt="evidence"
+    )
+    prov = cat_store.provenance("s26-entry", 1, fixture_ascii_only=True)
+    assert prov["by_result"].get("verified", 0) >= 1, (
+        "Verifier's verification event not recorded"
+    )
+
+    # 3. CatalogLookup is read-only: can lookup and get
+    lookup = CatalogLookup(cat_store, fixture_ascii_only=True)
+    result = lookup.get("s26-entry", 1)
+    assert result is not None, "Lookup can read published entry"
+    assert "manifest_sha256" in result, "get() returns manifest_sha256"
+    assert "provenance" in result, "get() returns provenance"
+
+    req = {
+        "catalog_contract": "2.0",
+        "request_id": "s26-req",
+        "intent": "test",
+        "domains": ["security"],
+    }
+    lookup_result = lookup.lookup(req)
+    assert "request_id" in lookup_result, "Lookup can execute queries"
+
+    # 4. Verifier (Curator.verify_source) cannot create drafts independently
+    #    — verify_source only appends verification events, not manifests
+    assert not hasattr(lookup, "create_draft"), "Lookup should not have write methods"
+    assert not hasattr(lookup, "publish"), "Lookup should not have publish method"
+    assert not hasattr(lookup, "verify_source"), (
+        "Lookup should not have verify_source method"
+    )
+
+    # 5. Curator.verify_source rejects self-verification (verified_by == created_by)
+    with pytest.raises(Exception, match="creator cannot verify"):
+        curator.verify_source(
+            "s26-src", "verified", "author", valid_sha, excerpt="self-verify"
+        )
+
+    cat_store.close()

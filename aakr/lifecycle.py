@@ -1715,7 +1715,12 @@ class LifecycleOrchestrator:
     def resume(
         self, item_id: str, *, scope: ReviewScope | None = None
     ) -> LifecycleState:
-        """Resume from a persisted checkpoint through all phases.
+        """Resume from a persisted checkpoint, skipping completed phases.
+
+        Phase-level recovery: when the checkpoint's recovery_state is 'reassess'
+        (all gaps resolved), skip research/record/verify/checkpoint and proceed
+        directly to reassessment. When recovery_state is 'research' (pending gaps
+        remain), re-run research/record/verify for pending gaps only.
 
         Detects material claim revisions: if a gap's description has changed
         since the checkpoint was created, the gap is removed from skip and
@@ -1748,13 +1753,28 @@ class LifecycleOrchestrator:
                             "resume: gap %s re-researched (description changed)", gap_id
                         )
         logger.info(
-            "resume: skip_gaps=%s, research_attempts=%d",
+            "resume: skip_gaps=%s, research_attempts=%d, recovery_state=%s",
             sorted(skip),
             cp.research_attempts,
+            cp.recovery_state,
         )
-        self.conduct_research(state, skip_gaps=skip, checkpoint_id=cp.checkpoint_id)
-        self.record_findings(state, checkpoint_id=cp.checkpoint_id)
-        self.verify_evidence(state)
-        self.checkpoint(state, skip_gaps=skip, retry_count=item.retry_count)
+
+        # Check if any gaps were removed from skip due to claim revision
+        revised_gaps = set(cp.resolved_gaps) - skip
+
+        if cp.recovery_state == "reassess" and not revised_gaps:
+            # All gaps resolved AND no claim revisions → skip to reassessment.
+            # Load existing research records so reassess has the evidence package
+            # without re-running research/record/verify phases.
+            state.research_records = self.record_store.get_all_for_item(item_id)
+            state.verification_result = self.verify_evidence(state)
+            state.checkpoint = cp
+            logger.info("resume: skipping to reassess (all gaps resolved)")
+        else:
+            # Either pending gaps or claim revisions → re-run research/verify.
+            self.conduct_research(state, skip_gaps=skip, checkpoint_id=cp.checkpoint_id)
+            self.record_findings(state, checkpoint_id=cp.checkpoint_id)
+            self.verify_evidence(state)
+            self.checkpoint(state, skip_gaps=skip, retry_count=item.retry_count)
         self.reassess(state)
         return state
