@@ -1,0 +1,11 @@
+command:
+  - python
+  - app.py
+
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: b6c290981788c233
+  - name: ALLOWED_PERSONAS
+    value: researcher,auditor,planner,builder
+  - name: SCHEMA_SOURCE
+    value: legacy
