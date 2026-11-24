@@ -30,9 +30,11 @@ logger = logging.getLogger(__name__)
 from aakr.catalog.models import CatalogError
 
 # ─── Review Mode Constants ───────────────────────────────────────────────
-REVIEW_AUTO = "auto_approve"
-REVIEW_MANUAL = "manual_review"
+REVIEW_AUTO = "auto_approve"  # opt-in only; NEVER the default
+REVIEW_MANUAL = "manual_review"  # DEFAULT: Host is sole workflow authority
 REVIEW_STAGED = "staged_review"
+REVIEW_EXTERNAL = "external_review"  # decisions made by the Host outside this system
+REVIEW_MODES = {REVIEW_AUTO, REVIEW_MANUAL, REVIEW_STAGED, REVIEW_EXTERNAL}
 
 
 @dataclass
@@ -252,17 +254,37 @@ class SimpleConnector:
         return results
 
 
-class SubmittedItemStore:
-    """Persists research work items independently of Catalog truth. Idempotent."""
+class StoreConnection:
+    """Storage backend for lifecycle stores.
 
-    def __init__(self, db_path: str):
+    Deployed configs inject `connection_factory` returning DB-API
+    connections with sqlite3.Row row semantics (e.g. a Unity Catalog-backed
+    adapter). A local SQLite file path is the local-testing fallback only -
+    never a deployed default.
+    """
+
+    db_path: str | None
+
+    def __init__(self, db_path: str | None = None, *, connection_factory=None):
+        if connection_factory is None and not db_path:
+            raise ValueError("db_path or connection_factory is required")
         self.db_path = db_path
-        self._init_schema()
+        self._connection_factory = connection_factory
 
     def _conn(self):
+        if self._connection_factory is not None:
+            return self._connection_factory()
         c = sqlite3.connect(self.db_path, isolation_level=None, timeout=3)
         c.row_factory = sqlite3.Row
         return c
+
+
+class SubmittedItemStore(StoreConnection):
+    """Persists research work items independently of Catalog truth. Idempotent."""
+
+    def __init__(self, db_path: str | None = None, *, connection_factory=None):
+        super().__init__(db_path, connection_factory=connection_factory)
+        self._init_schema()
 
     def _init_schema(self):
         with self._conn() as c:
@@ -366,17 +388,12 @@ class SubmittedItemStore:
             return items
 
 
-class RecordStore:
+class RecordStore(StoreConnection):
     """Persists full research records linked to checkpoint and source refs."""
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+    def __init__(self, db_path: str | None = None, *, connection_factory=None):
+        super().__init__(db_path, connection_factory=connection_factory)
         self._init_schema()
-
-    def _conn(self):
-        c = sqlite3.connect(self.db_path, isolation_level=None, timeout=3)
-        c.row_factory = sqlite3.Row
-        return c
 
     def _init_schema(self):
         with self._conn() as c:
@@ -465,17 +482,12 @@ class RecordStore:
         )
 
 
-class CheckpointStore:
+class CheckpointStore(StoreConnection):
     """Persists lifecycle checkpoints with retry tracking — survives interruption."""
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+    def __init__(self, db_path: str | None = None, *, connection_factory=None):
+        super().__init__(db_path, connection_factory=connection_factory)
         self._init_schema()
-
-    def _conn(self):
-        c = sqlite3.connect(self.db_path, isolation_level=None, timeout=3)
-        c.row_factory = sqlite3.Row
-        return c
 
     def _init_schema(self):
         with self._conn() as c:
@@ -546,17 +558,12 @@ class CheckpointStore:
             )
 
 
-class ReviewStore:
+class ReviewStore(StoreConnection):
     """Persists scope review decisions — review workflow with audit trail."""
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+    def __init__(self, db_path: str | None = None, *, connection_factory=None):
+        super().__init__(db_path, connection_factory=connection_factory)
         self._init_schema()
-
-    def _conn(self):
-        c = sqlite3.connect(self.db_path, isolation_level=None, timeout=3)
-        c.row_factory = sqlite3.Row
-        return c
 
     def _init_schema(self):
         with self._conn() as c:
@@ -1355,20 +1362,32 @@ class LifecycleOrchestrator:
 
     def __init__(
         self,
-        db_path: str,
+        db_path: str | None,
         source_pool: DynamicSourcePool | list[dict[str, Any]],
         *,
         evidence_kind: str = "test_assertion",
         researcher_identity: str = "researcher",
         max_attempts: int = 3,
-        review_mode: str = REVIEW_AUTO,
+        review_mode: str = REVIEW_MANUAL,
+        connection_factory=None,
     ):
+        if review_mode not in REVIEW_MODES:
+            raise CatalogError(
+                f"unknown review_mode: {review_mode!r} "
+                f"(expected one of {sorted(REVIEW_MODES)})"
+            )
+        if connection_factory is None and not db_path:
+            raise ValueError("db_path or connection_factory is required")
         if isinstance(source_pool, list):
             source_pool = DynamicSourcePool(source_pool)
-        self.item_store = SubmittedItemStore(db_path)
-        self.record_store = RecordStore(db_path)
-        self.checkpoint_store = CheckpointStore(db_path)
-        self.review_store = ReviewStore(db_path)
+        self.item_store = SubmittedItemStore(
+            db_path, connection_factory=connection_factory
+        )
+        self.record_store = RecordStore(db_path, connection_factory=connection_factory)
+        self.checkpoint_store = CheckpointStore(
+            db_path, connection_factory=connection_factory
+        )
+        self.review_store = ReviewStore(db_path, connection_factory=connection_factory)
         self.researcher = AutonomousResearcher(
             source_pool,
             evidence_kind=evidence_kind,
@@ -1435,8 +1454,12 @@ class LifecycleOrchestrator:
     ) -> ReviewDecision:
         """Phase 3: Scope Review — configurable review workflow with persisted decisions.
 
-        Modes: auto_approve (default), manual_review (requires explicit approve),
-        staged_review (scope + findings both reviewed).
+        Modes: manual_review (DEFAULT - approval requires an explicit
+        approve_scope call; the Host is the sole workflow authority),
+        external_review (decisions made by the Host outside this system and
+        recorded here via approve_scope), staged_review (scope + findings
+        both reviewed), auto_approve (opt-in only; NEVER the default and
+        unreachable without an explicit constructor argument).
         """
         proposed = scope or ReviewScope()
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
