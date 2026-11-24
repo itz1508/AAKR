@@ -602,5 +602,343 @@ class ExtractionWiringContract(unittest.TestCase):
                                  source_text=self.source_text, provenance=[])
 
 
+class ContextDisciplineContract(unittest.TestCase):
+    """Gap-fix tests: no accumulated context; observable artifacts only."""
+
+    @classmethod
+    def setUpClass(cls):
+        from aakr.extraction import ExtractionSchema
+        cls.schema = ExtractionSchema(
+            "tool_reference", 1,
+            required_fields=("name", "category", "summary"),
+            field_types={"name": "str", "category": "str", "summary": "str"},
+        )
+        cls.criteria = EvaluationCriteria("tool_reference", 1, (
+            Criterion("schema_structure", "deterministic"),
+            Criterion("parameter_completeness", "deterministic"),
+            Criterion("hash_integrity", "deterministic"),
+            Criterion("provenance", "deterministic"),
+            Criterion("source_support", "semantic"),
+        ))
+
+    def test_no_accumulated_context_reaches_evaluator_or_refiner(self):
+        """The evaluator and refiner receive ONLY their pinned arguments:
+        current candidate + task + evidence + latest feedback - never prior
+        attempts, run history, or any accumulated conversation."""
+        val = rm.extraction_validator(self.schema)
+        ev_seen = []
+        ref_seen = []
+        def ev(a, c, s):
+            ev_seen.append((a, c, s))
+            ok = set(a.payload) >= {"name", "category", "summary"}
+            return EvaluationReport("ctx-sem-double", [Finding(
+                "source_support", "valid" if ok else "not_valid", [],
+                "" if ok else "incomplete", "" if ok else "complete the fields")])
+        def ref(a, rep, task, s):
+            ref_seen.append((a, rep, task, s))
+            if "summary" not in a.payload:
+                return [("summary", "Find tools")]  # grounded in source text
+            return []
+        art = CandidateArtifact("t1", "tool_reference",
+                                {"name": "discover_tools", "category": "retrieval"}, refs())
+        res = rm.refine(art, self.criteria, validator=val, evaluator=ev, refiner=ref)
+        self.assertEqual(res.run.termination_reason, "satisfied")
+        self.assertEqual(res.run.iterations, 1)
+        # Evaluator called once, with exactly (artifact, criteria, source_text) - no extras
+        self.assertEqual(len(ev_seen), 1)
+        e_a, e_c, e_s = ev_seen[0]
+        self.assertIsInstance(e_a, CandidateArtifact)
+        self.assertIs(e_c, self.criteria)
+        self.assertIsInstance(e_s, str)
+        # Refiner called once, with exactly (artifact, report, task, source_text)
+        self.assertEqual(len(ref_seen), 1)
+        r_a, r_rep, r_task, r_s = ref_seen[0]
+        self.assertIsInstance(r_a, CandidateArtifact)
+        self.assertIsInstance(r_rep, EvaluationReport)
+        self.assertIsInstance(r_task, str)
+        self.assertIsInstance(r_s, str)
+        # The refiner saw the CURRENT artifact, not the original or any history
+        self.assertNotIn("summary", r_a.payload)
+        # The only feedback context is the latest report - and since the
+        # deterministic layer had not yet passed, it is the DETERMINISTIC
+        # report (the semantic evaluator has not run at all yet)
+        self.assertTrue(r_rep.evaluator.startswith("deterministic:"))
+        det = [f.correction for f in r_rep.findings if f.status == "not_valid"]
+        self.assertEqual(det, ["add missing required fields: ['summary']"])
+        # No prior-attempt artifacts or run history leak: findings reference
+        # only the CURRENT candidate's failures
+        self.assertTrue(all(f.criterion in {"parameter_completeness"}
+                            for f in r_rep.findings if f.status == "not_valid"))
+
+    def test_run_history_records_observable_artifacts_only(self):
+        """RefinementRun.history carries ONLY digests and counts - never
+        payloads, findings text, or any chain-of-thought."""
+        val = rm.extraction_validator(self.schema)
+        def ev(a, c, s):
+            ok = set(a.payload) >= {"name", "category", "summary"}
+            return EvaluationReport("ctx-sem-double", [Finding(
+                "source_support", "valid" if ok else "not_valid", [],
+                "" if ok else "incomplete", "" if ok else "complete the fields")])
+        def ref(a, rep, task, s):
+            return [("summary", "Find tools")] if "summary" not in a.payload else []
+        art = CandidateArtifact("t1", "tool_reference",
+                                {"name": "discover_tools", "category": "retrieval"}, refs())
+        res = rm.refine(art, self.criteria, validator=val, evaluator=ev, refiner=ref)
+        self.assertEqual(res.run.termination_reason, "satisfied")
+        for entry in res.run.history:
+            self.assertEqual(sorted(entry.keys()),
+                             ["content_hash", "failing_set", "report_hash", "valid_count"])
+            self.assertRegex(entry["content_hash"], r"^[0-9a-f]{64}$")
+            self.assertRegex(entry["report_hash"], r"^[0-9a-f]{64}$")
+            self.assertIsInstance(entry["valid_count"], int)
+            self.assertIsInstance(entry["failing_set"], list)
+        # No payload or finding text leaked into the serialized run record.
+        # Patch TUPLES are recorded by design (the audit trail of exact
+        # changes applied - observable, like a git diff); the candidate
+        # payload itself and any findings/reasoning text must NOT appear.
+        import json
+        serialized = json.dumps({
+            "history": res.run.history,
+            "revisions": [r.__dict__ for r in res.run.revisions],
+        })
+        for leak in ("discover_tools", "complete the fields", "retrieval"):
+            self.assertNotIn(leak, serialized)
+        # The applied patch IS recorded - exact-change observability by design
+        self.assertIn('["summary", "Find tools"]', serialized)
+
+
+class ContractEvaluationContract(unittest.TestCase):
+    """R2.2: contract optimization evaluator - draft-only, never mutates
+    published rows, no publish path."""
+
+    SRC = ("Implementation: handlers.explore.run. Input schema is an object "
+           "with property q. Output schema is an object. Scope: "
+           "databricks-statement-execution.")
+    REFS = [SourceRef("api-docs", "https://example.org/api/explore", H)]
+
+    @staticmethod
+    def good_contract():
+        return {
+            "tool_contract_id": "T1-tc1", "entry_id": "T1", "version": 1,
+            "input_schema": '{"type":"object","properties":{"q":{}}}',
+            "output_schema": '{"type":"object"}',
+            "handler_ref": "handlers.explore.run",
+            "invocation_scope": "databricks-statement-execution",
+        }
+
+    def _evaluator(self, grounded=None, state=None):
+        def ev(a, c, s):
+            if state is not None:
+                state["calls"] = state.get("calls", 0) + 1
+            ok = grounded(a.payload) if grounded else (
+                a.payload.get("handler_ref") == "handlers.explore.run"
+                and a.payload.get("invocation_scope") == "databricks-statement-execution")
+            return EvaluationReport("contract-sem-double", [Finding(
+                "contract_consistency", "valid" if ok else "not_valid", [],
+                "" if ok else "contract disagrees with implementation",
+                "" if ok else "align the contract with the API documentation")])
+        return ev
+
+    def test_draft_contract_refined_and_persisted_as_new_draft_zero_publish(self):
+        import tempfile
+        from aakr.curator import Curator
+        from aakr.catalog.models import manifest
+        from aakr.integrations.sqlite.adapter import SQLiteStore
+
+        draft = self.good_contract()
+        draft["handler_ref"] = "handlers explore run"  # malformed: whitespace
+        draft.pop("invocation_scope")  # missing field
+        original = dict(draft)
+        state = {"calls": 0}
+
+        def refiner(a, rep, task, s):
+            targets = set(rm.patch_targets(rep))
+            patches = []
+            if "handler_ref_format" in targets:
+                patches.append(("handler_ref", "handlers.explore.run"))  # grounded in SRC
+            if "required_fields" in targets:
+                patches.append(("invocation_scope", "databricks-statement-execution"))
+            return patches
+
+        refined, run = rm.refine_contract(
+            draft, evaluator=self._evaluator(state=state), refiner=refiner,
+            source_text=self.SRC, provenance=self.REFS)
+        self.assertEqual(run.run.termination_reason, "satisfied")
+        self.assertIsNotNone(refined)
+        # NEW dict with exactly the catalog contract fields; original untouched
+        self.assertEqual(sorted(refined), sorted(rm.CONTRACT_FIELDS))
+        self.assertEqual(draft, original)  # caller input never mutated
+        self.assertNotIn("invocation_scope", draft)
+        # Deterministic-first: the semantic evaluator ran once, only after det was clean
+        self.assertEqual(state["calls"], 1)
+        self.assertEqual(run.run.iterations, 1)
+
+        # Persist the refined contract as part of a NEW draft tool bundle
+        with tempfile.TemporaryDirectory() as d:
+            store = SQLiteStore(str(Path(d) / "contract.db"), initialize=True)
+            curator = Curator(store, principal=PRINCIPAL, fixture_ascii_only=True)
+            bundle = {
+                "entry": {"entry_id": "T1", "entry_type": "tool"},
+                "version": {
+                    "entry_id": "T1", "version": 1, "title": "Data Explorer Tool",
+                    "content_path": "blob://T1/1", "content_sha256": H,
+                    "created_by": PRINCIPAL, "created_at": "2026-11-24T01:00:00Z",
+                    "supersedes_version": None,
+                    "derived_from_ref": None, "derived_from_sha256": None,
+                },
+                "tags": [], "groups": [], "conditions": [], "sections": [],
+                "tool_contracts": [dict(refined, entry_id="T1", version=1)],
+                "links": [], "sources": [], "questions": [],
+            }
+            digest = manifest(bundle, fixture_ascii_only=True)
+            curator.create_draft(bundle, digest)
+            self.assertIsNotNone(store.state_bundle("T1", 1))
+            self.assertEqual(store.published_versions(), [])  # ZERO publish events
+            store.close()
+
+    def test_invalid_json_schema_flagged_and_repaired(self):
+        draft = self.good_contract()
+        draft["input_schema"] = "{not json"
+        def refiner(a, rep, task, s):
+            if "schema_validity" in set(rm.patch_targets(rep)):
+                return [("input_schema", '{"type":"object","properties":{"q":{}}}')]
+            return []
+        refined, run = rm.refine_contract(
+            draft, evaluator=self._evaluator(), refiner=refiner,
+            source_text=self.SRC, provenance=self.REFS)
+        self.assertEqual(run.run.termination_reason, "satisfied")
+        import json as _json
+        self.assertEqual(_json.loads(refined["input_schema"]),
+                         {"type": "object", "properties": {"q": {}}})
+
+    def test_unrepairable_contract_returns_none_with_termination_reason(self):
+        draft = self.good_contract()
+        draft["version"] = 0  # identity violation the refiner never fixes
+        def refiner(a, rep, task, s):
+            return [("noise", 1)]  # never repairs identity_consistency
+        refined, run = rm.refine_contract(
+            draft, evaluator=self._evaluator(), refiner=refiner,
+            source_text=self.SRC, provenance=self.REFS)
+        self.assertIsNone(refined)
+        self.assertIn(run.run.termination_reason, rm.TERMINATION_REASONS)
+        self.assertNotEqual(run.run.termination_reason, "satisfied")
+
+    def test_refine_contract_input_guards(self):
+        good = self.good_contract()
+        with self.assertRaises(CatalogError):
+            rm.refine_contract(good, evaluator=self._evaluator(), refiner=lambda *a: [],
+                              source_text=self.SRC, provenance=[])
+        with self.assertRaises(CatalogError):
+            rm.refine_contract("not-a-dict", evaluator=self._evaluator(),
+                              refiner=lambda *a: [], source_text=self.SRC,
+                              provenance=self.REFS)
+
+    def test_module_exposes_no_publish_or_store_write_path(self):
+        names = [n for n in dir(rm) if not n.startswith("_")]
+        for banned in ("publish", "delete_version", "update_version", "promote"):
+            self.assertFalse([n for n in names if banned in n],
+                             f"refinement module must expose no {banned} path")
+
+
+class SummaryEvaluationContract(unittest.TestCase):
+    """R3.3: shadow summary refinement - derived artifacts never replace
+    contracts."""
+
+    SRC = ("The AAKR catalog stores knowledge entries. Publication is "
+           "Curator-governed. All writes are append-only.")
+    REFS = [SourceRef("documentation", "https://example.org/aakr-docs", H)]
+
+    @staticmethod
+    def _evaluator(state=None):
+        def ev(a, c, s):
+            if state is not None:
+                state["calls"] = state.get("calls", 0) + 1
+            text = a.payload.get("summary", "")
+            covered = "entries" in text.lower() or "catalog" in text.lower()
+            consistent = ("append-only" in text.lower() or "governed" in text.lower()
+                          or not text)
+            findings = [
+                rm.Finding("coverage", "valid" if covered else "not_valid", [],
+                           "" if covered else "missing key points",
+                           "" if covered else "cover the catalog/entries key point"),
+                rm.Finding("factual_consistency", "valid" if consistent else "not_valid", [],
+                           "" if consistent else "unsupported claim",
+                           "" if consistent else "remove unsupported claims"),
+            ]
+            return rm.EvaluationReport("summary-sem-double", findings)
+        return ev
+
+    def test_summary_refined_to_satisfaction(self):
+        state = {"calls": 0}
+        def refiner(a, rep, task, s):
+            targets = set(rm.patch_targets(rep))
+            text = a.payload.get("summary", "")
+            if "coverage" in targets and "catalog" not in text.lower():
+                return [("summary", "The AAKR catalog stores knowledge entries.")]
+            if "factual_consistency" in targets:
+                return [("summary", "The AAKR catalog stores knowledge entries. "
+                                   "Publication is Curator-governed.")]
+            return []
+        refined, run = rm.refine_summary(
+            "An orange cat naps loudly.",  # well-formed but unsupported
+            evaluator=self._evaluator(state), refiner=refiner,
+            source_text=self.SRC, provenance=self.REFS)
+        self.assertEqual(run.run.termination_reason, "satisfied")
+        self.assertIn("catalog", refined.lower())
+        # deterministic layer passed from the start, so only the semantic
+        # criteria were failing; the evaluator ran each iteration
+        self.assertGreaterEqual(state["calls"], 1)
+        self.assertLessEqual(run.run.iterations, rm.RefinementLimits().max_iterations)
+
+    GROUNDED = "The AAKR catalog stores knowledge entries. Publication is Curator-governed."
+
+    def test_blank_summary_fails_deterministic_layer_evaluator_skipped(self):
+        state = {"calls": 0}
+        def refiner(a, rep, task, s):
+            if "well_formed" in set(rm.patch_targets(rep)):
+                return [("summary", self.GROUNDED)]  # fixes form AND semantics
+            return []
+        refined, run = rm.refine_summary(
+            "   ",  # blank: deterministic well_formed fails
+            evaluator=self._evaluator(state), refiner=refiner,
+            source_text=self.SRC, provenance=self.REFS)
+        self.assertEqual(run.run.termination_reason, "satisfied")
+        self.assertEqual(refined, self.GROUNDED)
+        self.assertEqual(state["calls"], 1)  # only after the deterministic fix
+
+    def test_overlong_summary_rejected_until_fixed(self):
+        def refiner(a, rep, task, s):
+            if "well_formed" in set(rm.patch_targets(rep)):
+                return [("summary", self.GROUNDED)]
+            return []
+        ev = self._evaluator()
+        refined, run = rm.refine_summary(
+            "x" * (rm.SUMMARY_MAX_LEN + 1),
+            evaluator=ev, refiner=refiner, source_text=self.SRC, provenance=self.REFS)
+        self.assertEqual(run.run.termination_reason, "satisfied")
+        self.assertEqual(refined, self.GROUNDED)
+
+    def test_non_progressing_refiner_terminates_on_oscillation_not_hang(self):
+        # A refiner that re-applies the same patch every iteration must be
+        # stopped by the oscillation tripwire - never an infinite loop.
+        def refiner(a, rep, task, s):
+            return [("summary", "An orange cat naps loudly.")]  # never fixes
+        refined, run = rm.refine_summary(
+            "An orange cat naps loudly.",
+            evaluator=self._evaluator(), refiner=refiner,
+            source_text=self.SRC, provenance=self.REFS)
+        self.assertIsNone(refined)
+        self.assertEqual(run.run.termination_reason, "oscillation")
+        self.assertLessEqual(run.run.iterations, rm.RefinementLimits().max_iterations)
+
+    def test_refine_summary_input_guards(self):
+        with self.assertRaises(CatalogError):
+            rm.refine_summary("ok", evaluator=self._evaluator(), refiner=lambda *a: [],
+                              source_text=self.SRC, provenance=[])
+        with self.assertRaises(CatalogError):
+            rm.refine_summary(42, evaluator=self._evaluator(), refiner=lambda *a: [],
+                              source_text=self.SRC, provenance=self.REFS)
+
+
 if __name__ == "__main__":
     unittest.main()

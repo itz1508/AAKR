@@ -9,6 +9,7 @@ checkpoint, and advances only when new evidence addresses remaining gaps.
 
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 import time
@@ -395,3 +396,75 @@ def create_test_items() -> list[SubmittedItem]:
     )
 
     return items
+
+
+# ---------------------------------------------------------------------------
+# SHADOW retrieval ranking metrics (todo 11; library-only).
+#
+# Pure functions over ranked id lists. SHADOW PROFILE: these metrics are
+# computed offline against paired runs and are NEVER wired into the
+# /discover request path; enabling shadow evaluation of live retrieval
+# remains gated on the post-cutover soak. No service or store access.
+# ---------------------------------------------------------------------------
+
+
+def _unique_top(ranked: list[str], k: int) -> list[str]:
+    """Unique ids within the first k POSITIONS of the ranking, order-
+    preserving. k bounds the slots examined, not the unique count - so a
+    duplicate id beyond position k is never counted, and duplicates within
+    the top-k never count as multiple hits."""
+    return list(dict.fromkeys(list(ranked)[:k]))
+
+
+def precision_at_k(ranked: list[str], relevant: set[str], k: int | None = None) -> float:
+    """|unique top-k(retrieved) intersect relevant| / k. 0.0 when k <= 0 or k set."""
+    k = len(ranked) if k is None else k
+    if k <= 0:
+        return 0.0
+    top = _unique_top(ranked, k)
+    hits = sum(1 for d in top if d in relevant)
+    return hits / k
+
+
+def recall_at_k(ranked: list[str], relevant: set[str], k: int | None = None) -> float:
+    """|unique top-k(retrieved) intersect relevant| / |relevant|; 0.0 when
+    relevant is empty (nothing to recall - degenerate query, not a perfect
+    score). Never exceeds 1.0, even with duplicate hits."""
+    if not relevant:
+        return 0.0
+    k = len(ranked) if k is None else k
+    top = _unique_top(ranked, k)
+    hits = sum(1 for d in top if d in relevant)
+    return hits / len(relevant)
+
+
+def f1_at_k(ranked: list[str], relevant: set[str], k: int | None = None) -> float:
+    """Harmonic mean of precision@k and recall@k; 0.0 when both are 0."""
+    p = precision_at_k(ranked, relevant, k)
+    r = recall_at_k(ranked, relevant, k)
+    return 0.0 if p + r == 0 else 2 * p * r / (p + r)
+
+
+def reciprocal_rank(ranked: list[str], relevant: set[str]) -> float:
+    """1/rank of the first relevant result; 0.0 when none is relevant."""
+    for i, d in enumerate(ranked, start=1):
+        if d in relevant:
+            return 1.0 / i
+    return 0.0
+
+
+def ndcg_at_k(ranked: list[str], relevant: set[str], k: int | None = None) -> float:
+    """Binary-relevance NDCG@k: DCG over the top-k ranking divided by the
+    ideal DCG over min(k, |relevant|) perfect positions. 0.0 when relevant
+    is empty or the top-k contains no relevant result."""
+    if not relevant:
+        return 0.0
+    k = len(ranked) if k is None else k
+    if k <= 0:
+        return 0.0
+    top = _unique_top(ranked, k)
+    dcg = sum(1.0 / math.log2(i + 1)
+              for i, d in enumerate(top, start=1) if d in relevant)
+    ideal = min(k, len(relevant))
+    idcg = sum(1.0 / math.log2(i + 1) for i in range(1, ideal + 1))
+    return 0.0 if idcg == 0 else dcg / idcg
