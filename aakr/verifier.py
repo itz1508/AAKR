@@ -29,8 +29,10 @@ class Verifier:
     """
 
     def __init__(self, store, *, actor_identity: str | None = None):
+        if not actor_identity or not str(actor_identity).strip():
+            raise CatalogError("verifier requires an authenticated principal")
         self.store = store
-        self.actor_identity = actor_identity
+        self.actor_identity = str(actor_identity).strip()
 
     def verify(
         self,
@@ -55,6 +57,10 @@ class Verifier:
             raise CatalogError(f"invalid result: {result}")
         if not verified_by or not verified_by.strip():
             raise CatalogError("verified_by must be nonblank")
+        if verified_by.strip().lower() != self.actor_identity.lower():
+            raise CatalogError(
+                "verified_by must match the authenticated verifier principal"
+            )
         if not HEX.fullmatch(checked_source_sha256):
             raise CatalogError("checked_source_sha256 must be 64-char lowercase hex")
         if result == "verified" and (not excerpt or not excerpt.strip()):

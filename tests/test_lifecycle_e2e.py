@@ -1414,7 +1414,7 @@ def test_s24_all_four_verification_statuses_in_provenance():
 
     temp_dir = tempfile.mkdtemp()
     cat_store = SQLiteStore(os.path.join(temp_dir, "s24.db"), initialize=True)
-    curator = Curator(cat_store, fixture_ascii_only=True)
+    curator = Curator(cat_store, principal="author", fixture_ascii_only=True)
     ts = "2026-01-01T00:00:00Z"
     valid_sha = "a" * 64
 
@@ -1532,7 +1532,7 @@ def test_s25_published_knowledge_retrieval():
 
     temp_dir = tempfile.mkdtemp()
     cat_store = SQLiteStore(os.path.join(temp_dir, "s25.db"), initialize=True)
-    curator = Curator(cat_store, fixture_ascii_only=True)
+    curator = Curator(cat_store, principal="author", fixture_ascii_only=True)
     ts = "2026-01-01T00:00:00Z"
     valid_sha = "a" * 64
 
@@ -1679,7 +1679,7 @@ def test_s26_authority_isolation():
 
     temp_dir = tempfile.mkdtemp()
     cat_store = SQLiteStore(os.path.join(temp_dir, "s26.db"), initialize=True)
-    curator = Curator(cat_store, fixture_ascii_only=True)
+    curator = Curator(cat_store, principal="author", fixture_ascii_only=True)
     ts = "2026-01-01T00:00:00Z"
     valid_sha = "a" * 64
 

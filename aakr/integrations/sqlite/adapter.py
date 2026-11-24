@@ -357,6 +357,37 @@ class SQLiteStore(StorageAdapter):
                 ),
             )
 
+    def create_fulltext_index(self, rows: list[dict[str, Any]]) -> bool:
+        """Create and populate an FTS5 full-text index over published rows.
+
+        Derived index: dropped and rebuilt on every generation. Returns
+        False when FTS5 is unavailable (compiled out) — the caller must
+        then report the full-text channel as unavailable, never as a
+        metadata-only stand-in.
+        """
+        try:
+            self.c.execute("DROP TABLE IF EXISTS catalog_fts")
+            self.c.execute(
+                "CREATE VIRTUAL TABLE catalog_fts USING fts5("
+                "entry_id UNINDEXED, version UNINDEXED, title, body)"
+            )
+            self.c.executemany(
+                "INSERT INTO catalog_fts (entry_id, version, title, body) "
+                "VALUES (?,?,?,?)",
+                [
+                    (
+                        r.get("entry_id", ""),
+                        r.get("version", 0),
+                        r.get("title", ""),
+                        r.get("text", ""),
+                    )
+                    for r in rows
+                ],
+            )
+            return True
+        except sqlite3.OperationalError:
+            return False
+
 
 # Compatibility alias for aakr.integrations.sqlite.__init__
 SQLiteCatalogAdapter = SQLiteStore

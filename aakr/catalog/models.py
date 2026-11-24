@@ -6,7 +6,9 @@ floats, and any non-ASCII input. Never use it for production digests.
 
 The manifest payload includes: profile ID, stable entry identity/type,
 all immutable version fields except manifest_sha256, sorted tags, groups,
-conditions, sections, links, source associations, and open questions.
+conditions, sections (with optional ordinal for playbook steps), tool
+contracts (input/output schemas, handler reference, invocation scope),
+links, source associations, and open questions.
 Excludes: status events, verification events, mutable index state.
 """
 
@@ -17,7 +19,7 @@ import json
 import re
 from typing import Any
 
-MANIFEST_PROFILE = "oneshot-catalog-manifest-v1"
+MANIFEST_PROFILE = "oneshot-catalog-manifest-v2"
 VERIFICATION_PROFILE = "oneshot-catalog-verification-v1"
 
 HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -30,7 +32,14 @@ ALLOWED_TAGS = {
     "framework",
     "intent",
     "file_signal",
+    "persona",
 }
+
+# Entry types are a governed vocabulary. "tool" entries require at least
+# one tool_contracts child collection (executable capability definition,
+# distinct from catalog metadata); "playbook" entries require ordered
+# (ordinal) sections. Curator enforces both at draft time.
+ALLOWED_ENTRY_TYPES = {"knowledge", "tool", "playbook", "template", "document"}
 ALLOWED_GROUPS = {"all_of", "any_of", "none_of"}
 ALLOWED_EVIDENCE = {
     "file_range",
@@ -121,7 +130,23 @@ MANIFEST_FIELDS = {
         "value",
         "required_evidence",
     ),
-    "sections": ("section_id", "entry_id", "version", "heading", "summary"),
+    "sections": (
+        "section_id",
+        "entry_id",
+        "version",
+        "heading",
+        "summary",
+        "ordinal",
+    ),
+    "tool_contracts": (
+        "tool_contract_id",
+        "entry_id",
+        "version",
+        "input_schema",
+        "output_schema",
+        "handler_ref",
+        "invocation_scope",
+    ),
     "links": (
         "link_id",
         "from_entry_id",
@@ -153,6 +178,7 @@ COLLECTIONS = {
     "links": ("entry_links", "link_id"),
     "sources": ("source_refs", "source_ref_id"),
     "questions": ("open_questions", "question_id"),
+    "tool_contracts": ("tool_contracts", "tool_contract_id"),
 }
 
 
@@ -166,6 +192,13 @@ def normalize_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     if "entry" not in bundle or "version" not in bundle:
         raise CatalogError("entry and version are required")
     result: dict[str, Any] = {"profile": MANIFEST_PROFILE}
+
+    _entry = bundle.get("entry")
+    if (
+        not isinstance(_entry, dict)
+        or _entry.get("entry_type") not in ALLOWED_ENTRY_TYPES
+    ):
+        raise CatalogError("entry must be a dict with a known entry_type")
 
     for key in ("entry", "version"):
         values = bundle[key]

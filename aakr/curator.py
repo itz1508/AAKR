@@ -29,14 +29,26 @@ from aakr.catalog.models import (
 
 
 class Curator:
+    """The only admitted writer of Catalog manifests and status.
+
+    Requires an authenticated principal at construction. All writes are
+    attributed to that principal: bundles whose created_by does not match
+    the principal are rejected (no authoring under another identity), and
+    publish/deprecate actors must match it.
+    """
+
     def __init__(
         self,
         store,
         *,
+        principal: str | None = None,
         fixture_ascii_only: bool = False,
         validation_receipt: Callable[[str, str], bool] | None = None,
-    ):
+    ) -> None:
+        if not principal or not str(principal).strip():
+            raise CatalogError("curator requires an authenticated principal")
         self.store = store
+        self.principal = str(principal).strip()
         self.fixture_ascii_only = fixture_ascii_only
         self.validation_receipt = validation_receipt
 
@@ -61,18 +73,30 @@ class Curator:
         v = normalized["version"]["version"]
         if normalized["version"]["entry_id"] != eid or type(v) is not int or v < 1:
             raise CatalogError("bad manifest identity")
+        if (
+            str(normalized["version"]["created_by"]).strip().lower()
+            != self.principal.lower()
+        ):
+            raise CatalogError(
+                "bundle created_by must match the authenticated curator principal"
+            )
         calculated = manifest(bundle, fixture_ascii_only=self.fixture_ascii_only)
         if calculated != expected_manifest:
             raise CatalogError("precommitted manifest disagrees with supplied bundle")
 
-        # Learning proposal validation
+        # Learning proposal validation: a trusted derivation requires a
+        # 64-hex derived_from_sha256 digest and a validation receipt.
         dref = normalized["version"]["derived_from_ref"]
         ddigest = normalized["version"]["derived_from_sha256"]
-        if dref is not None and (
-            self.validation_receipt is None
-            or not self.validation_receipt(dref, ddigest)
-        ):
-            raise CatalogError("learning proposal lacks trusted final validation")
+        if dref is not None:
+            if ddigest is None or not HEX.fullmatch(ddigest):
+                raise CatalogError(
+                    "learning proposal requires a derived_from_sha256 digest"
+                )
+            if self.validation_receipt is None or not self.validation_receipt(
+                dref, ddigest
+            ):
+                raise CatalogError("learning proposal lacks trusted final validation")
 
         # Empty applicability groups forbidden
         group_ids = {g["group_id"] for g in normalized["groups"]}
@@ -83,6 +107,23 @@ class Curator:
                 raise CatalogError("empty applicability group")
         if any(x["group_id"] not in group_ids for x in normalized["conditions"]):
             raise CatalogError("condition lacks owning group")
+
+        # Tool and playbook contract validation (manifest v2)
+        if normalized["entry"]["entry_type"] == "tool":
+            if not normalized["tool_contracts"]:
+                raise CatalogError("tool entry requires at least one tool contract")
+            for tc in normalized["tool_contracts"]:
+                for required in ("input_schema", "handler_ref", "invocation_scope"):
+                    if not str(tc.get(required) or "").strip():
+                        raise CatalogError(
+                            f"tool contract requires nonblank {required}"
+                        )
+        elif normalized["entry"]["entry_type"] == "playbook":
+            if not normalized["sections"]:
+                raise CatalogError("playbook entry requires ordered steps")
+            for s in normalized["sections"]:
+                if not isinstance(s.get("ordinal"), int):
+                    raise CatalogError("playbook steps require integer ordinal")
 
         with self.store.transaction(write=True):
             old = self.store.query_one(
@@ -253,16 +294,23 @@ class Curator:
         eid: str,
         version: int,
         *,
-        actor: str = "curator",
+        actor: str | None = None,
         fault_at: str | None = None,
     ) -> None:
         """Publish a draft version: validate all checks, append published status,
         deprecate predecessor atomically.
 
+        The publication event is attributed to the authenticated curator
+        principal; an explicitly passed actor must match it.
+
         Checks: manifest recompute, content SHA, claim targets, empty groups,
         group-mode consistency, source association uniqueness, link target
         publication history, part_of cycle freedom, supersession policy.
         """
+        if actor is None:
+            actor = self.principal
+        elif actor.strip().lower() != self.principal.lower():
+            raise CatalogError("actor must match the authenticated curator principal")
         with self.store.transaction(write=True):
             cur = self.store.query_one(
                 "SELECT status FROM version_current_status WHERE entry_id=? AND version=?",
@@ -384,8 +432,12 @@ class Curator:
             else:
                 self.store.execute_batch(batch_statements)
 
-    def deprecate(self, eid: str, version: int, *, actor: str = "curator") -> None:
-        """Deprecate a draft or published version."""
+    def deprecate(self, eid: str, version: int, *, actor: str | None = None) -> None:
+        """Deprecate a draft or published version (attributed to the principal)."""
+        if actor is None:
+            actor = self.principal
+        elif actor.strip().lower() != self.principal.lower():
+            raise CatalogError("actor must match the authenticated curator principal")
         with self.store.transaction(write=True):
             row = self.store.query_one(
                 "SELECT status FROM version_current_status "
@@ -427,9 +479,23 @@ class Curator:
     ) -> None:
         """Append a verification event keyed by (source_ref_id, seq).
 
-        verified_by must not equal entry-version created_by.
-        verified requires nonblank excerpt.
+        verified_by must be nonblank and must not equal the entry-version
+        created_by — enforced here in code so SQLite (trigger) and Databricks
+        (no triggers) behave identically. verified requires nonblank excerpt.
         """
+        if not verified_by or not verified_by.strip():
+            raise CatalogError("verified_by must be nonblank")
+        creator = self.store.query_one(
+            "SELECT v.created_by FROM entry_versions v "
+            "JOIN source_refs r ON r.entry_id=v.entry_id AND r.version=v.version "
+            "WHERE r.source_ref_id=?",
+            (rid,),
+        )
+        if (
+            creator
+            and creator["created_by"].strip().lower() == verified_by.strip().lower()
+        ):
+            raise CatalogError("creator cannot verify own version")
         self.store.append_source_verification(
             rid, result, verified_by, checked_source_sha256, excerpt=excerpt
         )

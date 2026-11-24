@@ -180,7 +180,7 @@ class CuratorReference(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = str(Path(self.tmp.name) / "catalog.db")
         self.c = connect(self.db, initialize=True)
-        self.cur = Curator(self.c, fixture_ascii_only=True)
+        self.cur = Curator(self.c, principal="author", fixture_ascii_only=True)
         self.b = bundle()
         self.digest = manifest(self.b, fixture_ascii_only=True)
 
@@ -267,6 +267,7 @@ class CuratorReference(unittest.TestCase):
         b = bundle(derived=True)
         approved = Curator(
             self.c,
+            principal="author",
             fixture_ascii_only=True,
             validation_receipt=lambda ref, digest: (
                 (ref, digest) == ("validated/task-1", H2)

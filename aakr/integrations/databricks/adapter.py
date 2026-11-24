@@ -439,6 +439,15 @@ class DatabricksStore(StorageAdapter):
                     f"WHERE v.version IS NULL"
                 ),
             ),
+            (
+                "orphaned tool contracts (no parent version)",
+                (
+                    f"SELECT tc.entry_id, tc.version FROM {s}.tool_contracts tc "
+                    f"LEFT JOIN {s}.entry_versions v "
+                    f"ON tc.entry_id = v.entry_id AND tc.version = v.version "
+                    f"WHERE v.version IS NULL"
+                ),
+            ),
         ]
         for label, query in checks:
             rows = self.spark.sql(query).collect()

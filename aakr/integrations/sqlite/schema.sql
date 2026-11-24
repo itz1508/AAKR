@@ -1,4 +1,5 @@
--- OneShot Catalog: SQLite reference schema, contract version 1
+-- OneShot Catalog: SQLite reference schema, contract version 2
+-- (manifest profile oneshot-catalog-manifest-v2: adds tool_contracts, section ordinal, persona tag)
 -- Only execute in a dedicated development database. Curator must verify pragmas on every connection.
 PRAGMA foreign_keys = ON;
 PRAGMA recursive_triggers = ON;
@@ -45,9 +46,21 @@ CREATE TABLE match_tags (
   entry_id TEXT NOT NULL,
   version INTEGER NOT NULL,
   tag_type TEXT NOT NULL CHECK (tag_type IN
-    ('domain','task_type','project_type','language','framework','intent','file_signal')),
+    ('domain','task_type','project_type','language','framework','intent','file_signal','persona')),
   value TEXT NOT NULL CHECK (length(trim(value)) > 0),
   UNIQUE (entry_id, version, tag_type, value),
+  FOREIGN KEY (entry_id, version) REFERENCES entry_versions(entry_id, version)
+);
+
+CREATE TABLE tool_contracts (
+  tool_contract_id TEXT NOT NULL,
+  entry_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  input_schema TEXT NOT NULL CHECK (length(trim(input_schema)) > 0),
+  output_schema TEXT NOT NULL DEFAULT '',
+  handler_ref TEXT NOT NULL CHECK (length(trim(handler_ref)) > 0),
+  invocation_scope TEXT NOT NULL CHECK (length(trim(invocation_scope)) > 0),
+  PRIMARY KEY (tool_contract_id, entry_id, version),
   FOREIGN KEY (entry_id, version) REFERENCES entry_versions(entry_id, version)
 );
 
@@ -83,6 +96,7 @@ CREATE TABLE content_sections (
   version INTEGER NOT NULL,
   heading TEXT NOT NULL,
   summary TEXT NOT NULL DEFAULT '',
+  ordinal INTEGER CHECK (ordinal IS NULL OR ordinal >= 1),
   PRIMARY KEY (section_id, entry_id, version),
   FOREIGN KEY (entry_id, version) REFERENCES entry_versions(entry_id, version)
 );
@@ -212,6 +226,10 @@ CREATE TRIGGER freeze_questions BEFORE INSERT ON open_questions WHEN
   COALESCE((SELECT status FROM version_status WHERE entry_id=NEW.entry_id AND version=NEW.version
     ORDER BY seq DESC LIMIT 1), 'missing') <> 'draft'
 BEGIN SELECT RAISE(ABORT, 'manifest is not draft'); END;
+CREATE TRIGGER freeze_tool_contracts BEFORE INSERT ON tool_contracts WHEN
+  COALESCE((SELECT status FROM version_status WHERE entry_id=NEW.entry_id AND version=NEW.version
+    ORDER BY seq DESC LIMIT 1), 'missing') <> 'draft'
+BEGIN SELECT RAISE(ABORT, 'manifest is not draft'); END;
 
 CREATE TRIGGER no_update_entries BEFORE UPDATE ON entries BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER no_delete_entries BEFORE DELETE ON entries BEGIN SELECT RAISE(ABORT, 'append-only'); END;
@@ -235,6 +253,8 @@ CREATE TRIGGER no_update_source_verifications BEFORE UPDATE ON source_verificati
 CREATE TRIGGER no_delete_source_verifications BEFORE DELETE ON source_verifications BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER no_update_open_questions BEFORE UPDATE ON open_questions BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER no_delete_open_questions BEFORE DELETE ON open_questions BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER no_update_tool_contracts BEFORE UPDATE ON tool_contracts BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER no_delete_tool_contracts BEFORE DELETE ON tool_contracts BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 
 CREATE VIEW version_current_status AS
 SELECT entry_id, version, status, seq

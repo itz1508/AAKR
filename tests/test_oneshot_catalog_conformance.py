@@ -213,7 +213,8 @@ class CatalogConformance(unittest.TestCase):
 
     def test_07_one_document_three_claims_allowed(self):
         self.c.execute(
-            "INSERT INTO content_sections VALUES (?,?,?,?,?)", ("s1", "E", 1, "A", "B")
+            "INSERT INTO content_sections VALUES (?,?,?,?,?,?)",
+            ("s1", "E", 1, "A", "B", 1),
         )
         self.c.execute(
             "INSERT INTO entry_links VALUES (?,?,?,?,?,?)",
@@ -423,8 +424,8 @@ class CatalogConformance(unittest.TestCase):
             ("tag1", "E", 1, "domain", "dev"),
         )
         self.c.execute(
-            "INSERT INTO content_sections VALUES (?,?,?,?,?)",
-            ("s1", "E", 1, "heading", "summary"),
+            "INSERT INTO content_sections VALUES (?,?,?,?,?,?)",
+            ("s1", "E", 1, "heading", "summary", 1),
         )
         self.c.execute(
             "INSERT INTO entry_links VALUES (?,?,?,?,?,?)",
@@ -496,8 +497,8 @@ class CatalogConformance(unittest.TestCase):
 
     def test_36_three_state_result_counts_sum(self):
         self.c.execute(
-            "INSERT INTO content_sections VALUES (?,?,?,?,?)",
-            ("s1", "E", 1, "heading", "summary"),
+            "INSERT INTO content_sections VALUES (?,?,?,?,?,?)",
+            ("s1", "E", 1, "heading", "summary", 1),
         )
         self.c.execute(
             "INSERT INTO entry_links VALUES (?,?,?,?,?,?)",
