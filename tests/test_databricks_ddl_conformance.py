@@ -11,6 +11,10 @@ the schema with AAKR_DDL_SCHEMA (default: aakr_catalog).
 
 Note: valid-row inserts use entry ids prefixed DDLCONF- and are append-only
 by design; validation drills in the execution plan use fresh schemas.
+test_10 uses a per-run unique entry id because its assertions resolve the
+version_current_status view, which depends on the entry's full status
+history — a fixed id would collide with rows from a previous run against
+the same persistent catalog (PKs are informational, not enforced).
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+import uuid
 from pathlib import Path
 
 _root = Path(__file__).resolve().parent.parent
@@ -183,7 +188,9 @@ class DDLConformance(unittest.TestCase):
 
     # 10. Publication views resolve correct semantics (ported: view suite)
     def test_10_views_resolve_publication_semantics(self):
-        eid = "DDLCONF-10"
+        # Unique per run: the view resolves the entry's full status history,
+        # so a fixed id would see rows left by a previous run of this suite.
+        eid = f"DDLCONF-10-{uuid.uuid4().hex[:8]}"
         self._insert_entry(eid)
         self.spark.sql(
             f"INSERT INTO {self.full}.version_status VALUES "
